@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#7659e8">
+  <title>Tovoice — turn your words into audio</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="Tovoice home"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>Tovoice<span class="brand-dot">.</span></a>
+      <div class="nav-label">WORKSPACE</div>
+      <nav aria-label="Main navigation">
+        <a class="nav-item active" href="#studio"><svg viewBox="0 0 24 24"><path d="M4 8h4l5-4v16l-5-4H4zM17 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/></svg>Audio studio</a>
+        <a class="nav-item" href="#library"><svg viewBox="0 0 24 24"><path d="M4 4h6v16H4zm10 0h6v16h-6zM6 8h2m8 0h2"/></svg>My recordings<span id="library-count" class="nav-count">0</span></a>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="local-indicator"><span></span>Local workspace</div>
+        <p>Your recordings live on this computer.</p>
+        <div class="profile"><span class="profile-avatar">T</span><div><strong>Your workspace</strong><small>Personal studio</small></div><span class="profile-more">•••</span></div>
+      </div>
+    </aside>
+
+    <main id="studio">
+      <header class="topbar"><span>Workspace <span class="breadcrumb-slash">/</span> <strong>Audio studio</strong></span><span id="connection" class="connection"><span></span>Connecting</span></header>
+      <div class="page-content">
+        <div class="page-heading"><div><div class="eyebrow">FROM PAGE TO PLAY</div><h1>Give your words a voice<span>.</span></h1><p>Drop in your Markdown. We’ll take care of the audio.</p></div><span class="heading-badge"><svg viewBox="0 0 24 24"><path d="m12 3 2.4 5.8L21 12l-6.6 3.2L12 21l-2.4-5.8L3 12l6.6-3.2z"/></svg>Powered by Gemini</span></div>
+
+        <div class="studio-grid">
+          <section class="upload-panel panel" aria-labelledby="upload-title">
+            <div class="section-top"><div class="section-label"><span class="step-number">01</span><h2 id="upload-title">Your document</h2></div><span class="muted-tag">MARKDOWN → AUDIO</span></div>
+            <input id="file-input" type="file" accept=".md,text/markdown" class="visually-hidden" aria-label="Upload Markdown file" tabindex="-1">
+            <button id="dropzone" class="dropzone" type="button">
+              <span class="upload-icon"><svg viewBox="0 0 48 48"><path d="M28 7H13a3 3 0 0 0-3 3v29a3 3 0 0 0 3 3h22a3 3 0 0 0 3-3V17L28 7zM28 7v10h10M24 33V22m-5 5 5-5 5 5"/></svg><span class="icon-plus">+</span></span>
+              <strong>Drop your Markdown here</strong><span>or <b>browse files</b> on your computer</span><small>.md files only · Up to 5 MB</small>
+            </button>
+            <div class="voice-row"><div><label for="voice">Narration voice</label><p>A clear, conversational explanation.</p></div><select id="voice" aria-label="Narration voice"><option value="Kore">Kore · Balanced</option></select></div>
+            <div class="upload-note"><svg viewBox="0 0 24 24"><path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.6 5.6l2.1 2.1m8.6 8.6 2.1 2.1M5.6 18.4l2.1-2.1m8.6-8.6 2.1-2.1"/><circle cx="12" cy="12" r="3"/></svg><span>Conversion starts on upload. Text is sent to Gemini for speech; the audio is saved locally.</span></div>
+            <div id="upload-error" class="error-box" role="alert" hidden></div>
+          </section>
+
+          <section class="progress-panel panel" aria-labelledby="progress-title">
+            <div class="section-top"><div class="section-label"><span class="step-number">02</span><h2 id="progress-title">Your recording</h2></div><span id="job-badge" class="status-badge neutral">Ready when you are</span></div>
+            <div id="empty-progress" class="empty-progress"><div class="wave-illustration" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div><h3>A little less reading.<br>A little more listening.</h3><p>Your document’s audio will appear here.</p></div>
+            <div id="job-progress" hidden>
+              <div class="active-document"><span class="file-symbol">MD</span><div><h3 id="job-filename"></h3><p id="job-details"></p></div></div>
+              <div class="progress-caption"><span id="progress-label">Preparing your narration</span><strong id="progress-percent">0%</strong></div><progress id="progress-bar" max="100" value="0" aria-label="Conversion progress"></progress>
+              <div class="progress-meta"><span id="segments">0 segments saved</span><span id="key-info"></span></div>
+              <div id="job-error" class="error-box" role="alert" hidden></div>
+              <div class="job-actions"><button id="resume-button" class="primary-button" type="button" hidden>Resume recording <span>↗</span></button><button id="cancel-button" class="cancel-button" type="button" hidden>Cancel recording</button></div>
+              <div id="audio-result" hidden><audio id="audio-player" controls preload="metadata" aria-label="Generated audio recording"></audio><div class="result-links"><a id="download-audio" class="primary-button" download>Download WAV <svg viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4M5 17v4h14v-4"/></svg></a><a id="download-text" class="text-link" download>Narration text</a></div><p class="saved-path">Saved on this computer<span id="output-path"></span></p></div>
+              <details id="transcript-details" class="transcript"><summary>Preview narration text<span>+</span></summary><pre id="transcript-text"></pre></details>
+            </div>
+          </section>
+        </div>
+
+        <div class="features"><div><span class="feature-icon"><svg viewBox="0 0 24 24"><path d="M4 5h16M4 10h10M4 15h7m6-3 2 2 4-5M4 20h16"/></svg></span><div><strong>Just the words that matter</strong><p>Formatting and symbols cleaned for speech.</p></div></div><div><span class="feature-icon"><svg viewBox="0 0 24 24"><path d="M20 7a8 8 0 1 0 0 10M20 3v4h-4M10 8v5l3 2"/></svg></span><div><strong>Picks up where it left off</strong><p>Saved segments survive pauses and retries.</p></div></div><div><span class="feature-icon"><svg viewBox="0 0 24 24"><path d="M4 4h14l2 2v14H4zM8 4v6h8V4M8 20v-6h8v6"/></svg></span><div><strong>Yours to keep</strong><p>A local WAV, ready to play or download.</p></div></div></div>
+
+        <section id="library" class="library" aria-labelledby="library-title"><div class="library-heading"><div><h2 id="library-title">Your recordings</h2><p>Everything you’ve brought to life.</p></div><span id="recording-count">0 recordings</span></div><div id="recordings-list" class="recordings-list"><div class="library-empty"><span class="library-empty-icon">♫</span><div><strong>Your listening library starts here</strong><p>Upload a document to make your first recording.</p></div><span class="empty-hint">Made for your ears.</span></div></div></section>
+        <footer><span>Tovoice · A voice for every document</span><span>Made to listen.</span></footer>
+      </div>
+    </main>
+  </div>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

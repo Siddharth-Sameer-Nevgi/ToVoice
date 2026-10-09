@@ -1,0 +1,2 @@
+markdown-it-py>=4.0,<5
+python-dotenv>=1.0,<2
