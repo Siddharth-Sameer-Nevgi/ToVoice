@@ -29,7 +29,7 @@
     <main id="studio">
       <header class="topbar"><span>Workspace <span class="breadcrumb-slash">/</span> <strong>Audio studio</strong></span><span id="connection" class="connection"><span></span>Connecting</span></header>
       <div class="page-content">
-        <div class="page-heading"><div><div class="eyebrow">FROM PAGE TO PLAY</div><h1>Give your words a voice<span>.</span></h1><p>Drop in your Markdown. We’ll take care of the audio.</p></div><span class="heading-badge"><svg viewBox="0 0 24 24"><path d="m12 3 2.4 5.8L21 12l-6.6 3.2L12 21l-2.4-5.8L3 12l6.6-3.2z"/></svg>Powered by Gemini</span></div>
+        <div class="page-heading"><div><div class="eyebrow">FROM PAGE TO PLAY</div><h1>Give your words a voice<span>.</span></h1><p>Drop in your Markdown. We’ll take care of the audio.</p></div><span class="heading-badge"><svg viewBox="0 0 24 24"><path d="m12 3 2.4 5.8L21 12l-6.6 3.2L12 21l-2.4-5.8L3 12l6.6-3.2z"/></svg>Local · Powered by Python</span></div>
 
         <div class="studio-grid">
           <section class="upload-panel panel" aria-labelledby="upload-title">
@@ -39,8 +39,8 @@
               <span class="upload-icon"><svg viewBox="0 0 48 48"><path d="M28 7H13a3 3 0 0 0-3 3v29a3 3 0 0 0 3 3h22a3 3 0 0 0 3-3V17L28 7zM28 7v10h10M24 33V22m-5 5 5-5 5 5"/></svg><span class="icon-plus">+</span></span>
               <strong>Drop your Markdown here</strong><span>or <b>browse files</b> on your computer</span><small>.md files only · Up to 5 MB</small>
             </button>
-            <div class="voice-row"><div><label for="voice">Narration voice</label><p>A clear, conversational explanation.</p></div><select id="voice" aria-label="Narration voice"><option value="Kore">Kore · Balanced</option></select></div>
-            <div class="upload-note"><svg viewBox="0 0 24 24"><path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.6 5.6l2.1 2.1m8.6 8.6 2.1 2.1M5.6 18.4l2.1-2.1m8.6-8.6 2.1-2.1"/><circle cx="12" cy="12" r="3"/></svg><span>Conversion starts on upload. Text is sent to Gemini for speech; the audio is saved locally.</span></div>
+            <div class="voice-row"><div><label for="voice">Narration voice</label><p>A clear, natural local voice.</p></div><select id="voice" aria-label="Narration voice"><option value="en_US-lessac-medium">Lessac · Clear narrator</option></select></div>
+            <div class="upload-note"><svg viewBox="0 0 24 24"><path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.6 5.6l2.1 2.1m8.6 8.6 2.1 2.1M5.6 18.4l2.1-2.1m8.6-8.6 2.1-2.1"/><circle cx="12" cy="12" r="3"/></svg><span>Conversion starts on upload. Your document and audio stay on this computer. Models download once on first use.</span></div>
             <div id="upload-error" class="error-box" role="alert" hidden></div>
           </section>
 
@@ -50,7 +50,7 @@
             <div id="job-progress" hidden>
               <div class="active-document"><span class="file-symbol">MD</span><div><h3 id="job-filename"></h3><p id="job-details"></p></div></div>
               <div class="progress-caption"><span id="progress-label">Preparing your narration</span><strong id="progress-percent">0%</strong></div><progress id="progress-bar" max="100" value="0" aria-label="Conversion progress"></progress>
-              <div class="progress-meta"><span id="segments">0 segments saved</span><span id="key-info"></span></div>
+              <div class="progress-meta"><span id="segments">0 segments saved</span><span id="engine-info"></span></div>
               <div id="job-error" class="error-box" role="alert" hidden></div>
               <div class="job-actions"><button id="resume-button" class="primary-button" type="button" hidden>Resume recording <span>↗</span></button><button id="cancel-button" class="cancel-button" type="button" hidden>Cancel recording</button></div>
               <div id="audio-result" hidden><audio id="audio-player" controls preload="metadata" aria-label="Generated audio recording"></audio><div class="result-links"><a id="download-audio" class="primary-button" download>Download WAV <svg viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4M5 17v4h14v-4"/></svg></a><a id="download-text" class="text-link" download>Narration text</a></div><p class="saved-path">Saved on this computer<span id="output-path"></span></p></div>

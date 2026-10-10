@@ -4,7 +4,7 @@ import unittest
 import wave
 from pathlib import Path
 
-from md_to_audio import QuotaError, SynthesisError, convert, markdown_text, split_chunks
+from md_to_audio import ConversionCancelled, SynthesisError, convert, markdown_text, split_chunks
 
 
 def wav_bytes(marker: int) -> bytes:
@@ -51,51 +51,50 @@ class MarkdownAudioTests(unittest.TestCase):
         self.assertEqual(" ".join(chunks), "One sentence. Another sentence. A final paragraph.")
         self.assertTrue(all(len(chunk) <= 100 for chunk in chunks))
 
-    def test_rotates_key_and_reuses_completed_segments_after_failure(self):
+    def test_reuses_completed_segments_after_local_failure(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as root:
             source = Path(root) / "story.md"
             output = Path(root) / "story.wav"
             source.write_text("First part. " * 20 + "Second part. " * 20, encoding="utf-8")
             calls = []
 
-            def first_run(chunk, key, model, voice):
-                calls.append(key)
+            def first_run(chunk, voice):
+                calls.append(chunk)
                 if len(calls) == 1:
                     return wav_bytes(1)
-                raise QuotaError("quota reached")
+                raise SynthesisError("local interruption")
 
             with self.assertRaises(SynthesisError):
-                convert(source, output, ["key-a", "key-b"], max_chars=100, generator=first_run)
-            self.assertEqual(calls[:3], ["key-a", "key-a", "key-b"])
+                convert(source, output, max_chars=100, generator=first_run)
+            self.assertEqual(len(calls), 2)
             self.assertFalse(output.exists())
-
             resumed_calls = []
 
-            def second_run(chunk, key, model, voice):
-                resumed_calls.append(key)
+            def second_run(chunk, voice):
+                resumed_calls.append(chunk)
                 return wav_bytes(2)
 
-            convert(source, output, ["key-b"], max_chars=100, generator=second_run)
-            self.assertTrue(output.exists())
+            convert(source, output, max_chars=100, generator=second_run)
             self.assertEqual(len(resumed_calls), len(split_chunks(markdown_text(source.read_text()), 100)) - 1)
             with wave.open(str(output), "rb") as reader:
                 self.assertEqual(reader.getnframes(), 10 * (len(resumed_calls) + 1))
 
-    def test_rotates_and_continues_same_segment(self):
+    def test_cancel_keeps_finished_segment_for_resume(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as root:
-            source = Path(root) / "short.md"
-            output = Path(root) / "short.wav"
+            source = Path(root) / "cancel.md"
+            output = Path(root) / "cancel.wav"
             source.write_text("A short story.", encoding="utf-8")
-            calls = []
+            stopped = []
 
-            def generate(chunk, key, model, voice):
-                calls.append(key)
-                if key == "exhausted":
-                    raise QuotaError("quota reached")
+            def generate(chunk, voice):
+                stopped.append(True)
                 return wav_bytes(3)
 
-            convert(source, output, ["exhausted", "backup"], generator=generate)
-            self.assertEqual(calls, ["exhausted", "backup"])
+            with self.assertRaises(ConversionCancelled):
+                convert(source, output, generator=generate, cancelled=lambda: bool(stopped))
+            self.assertFalse(output.exists())
+            self.assertEqual(len(list(Path(root).rglob("00001.wav"))), 1)
+            convert(source, output, generator=lambda *args: self.fail("Saved segment should be reused"))
             self.assertTrue(output.exists())
 
 

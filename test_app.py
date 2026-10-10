@@ -8,7 +8,7 @@ import urllib.request
 from pathlib import Path
 
 from app import JobStore, LocalServer
-from md_to_audio import QuotaError
+from local_audio import DEFAULT_MODEL, DEFAULT_VOICE
 from test_md_to_audio import wav_bytes
 
 
@@ -17,13 +17,11 @@ class WebAppTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
         self.calls = []
 
-        def generate(text, key, model, voice):
-            self.calls.append((text, key))
-            if key == "limited":
-                raise QuotaError("quota reached")
+        def generate(text, voice):
+            self.calls.append((text, voice))
             return wav_bytes(7)
 
-        self.store = JobStore(Path(self.temp.name) / "jobs", lambda: ["limited", "backup"], generate, transcriber=None)
+        self.store = JobStore(Path(self.temp.name) / "jobs", generator=generate, aligner=None)
         self.server = LocalServer(("127.0.0.1", 0), self.store)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -52,15 +50,14 @@ class WebAppTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail("Audio worker did not finish")
 
-    def test_upload_background_generation_backup_playback_and_deduplication(self):
-        upload = {"filename": "story.md", "source": "# A story\n\nA clear lesson for PATIENT/DOCTOR roles.", "voice": "Kore"}
+    def test_upload_background_generation_playback_and_deduplication(self):
+        upload = {"filename": "story.md", "source": "# A story\n\nA clear lesson for PATIENT/DOCTOR roles.", "voice": DEFAULT_VOICE}
         with self.request("/api/jobs", upload) as response:
             job_id = json.load(response)["id"]
         job = self.wait_for_job(job_id)
         self.assertEqual(job["state"], "complete")
         self.assertEqual(job["completed"], job["total"])
-        self.assertEqual(job["key_switches"], 1)
-        self.assertEqual([call[1] for call in self.calls], ["limited", "backup"])
+        self.assertEqual([call[1] for call in self.calls], [DEFAULT_VOICE])
         with self.request(f"/api/jobs/{job_id}/transcript") as response:
             narration = response.read().decode()
         self.assertNotIn("/", narration)
@@ -69,7 +66,7 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(response.read(), b"RIFF")
         with self.request("/api/jobs", upload) as response:
             self.assertEqual(json.load(response)["id"], job_id)
-        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(self.calls), 1)
 
     def test_rejects_non_markdown_and_cross_origin_requests(self):
         for data, headers, code in [
@@ -81,16 +78,46 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(error.exception.code, code)
         self.assertEqual(self.calls, [])
 
+    def test_config_requires_no_api_keys(self):
+        with self.request('/api/config') as response:
+            data = json.load(response)
+        self.assertEqual(data['engine'], 'local')
+        self.assertNotIn('key_count', data)
+        self.assertIn(DEFAULT_VOICE, data['voices'])
+
+    def test_incomplete_previous_engine_recording_restarts_locally_and_keeps_old_files(self):
+        job = self.store.create('previous.md', 'A previous recording.')
+        job = self.wait_for_job(job['id'])
+        previous_output = Path(job['output_path'])
+        previous_bytes = previous_output.read_bytes()
+        metadata = self.store.directory / job['id'] / 'job.json'
+        saved = json.loads(metadata.read_text())
+        saved.update(state='cancelled', model='previous-engine', voice='previous-voice')
+        metadata.write_text(json.dumps(saved))
+        self.store.close()
+        reopened = JobStore(self.store.directory, generator=self.store.generator, aligner=None)
+        self.store = reopened
+        self.server.store = reopened
+        self.assertTrue(reopened.get(job['id'])['needs_local_restart'])
+        reopened.resume(job['id'])
+        updated = self.wait_for_job(job['id'])
+        self.assertEqual(updated['state'], 'complete')
+        self.assertEqual(updated['model'], DEFAULT_MODEL)
+        self.assertEqual(updated['voice'], DEFAULT_VOICE)
+        self.assertFalse(updated['needs_local_restart'])
+        self.assertNotEqual(updated['output_path'], str(previous_output))
+        self.assertEqual(previous_output.read_bytes(), previous_bytes)
+        self.assertTrue(Path(updated['output_path']).exists())
+
     def test_readalong_endpoint_automatically_prepares_and_preserves_markdown(self):
-        self.store.key_loader = lambda: ["backup"]
         timing_calls = []
 
-        def transcribe(audio, key):
-            timing_calls.append(key)
+        def align(audio, text):
+            timing_calls.append(text)
             return [{"text": "Hello", "start": 0, "end": 0.0001},
                     {"text": "world", "start": 0.0001, "end": 0.0003}]
 
-        self.store.transcriber = transcribe
+        self.store.aligner = align
         job = self.store.create("readalong.md", "Hello **world**.")
         self.wait_for_job(job["id"])
         deadline = time.monotonic() + 5
@@ -129,7 +156,7 @@ class WebAppTests(unittest.TestCase):
         def unexpected_generation(*args):
             raise AssertionError("Saved segment should have been reused")
 
-        reopened = JobStore(self.store.directory, lambda: ["backup"], unexpected_generation, transcriber=None)
+        reopened = JobStore(self.store.directory, generator=unexpected_generation, aligner=None)
         self.store = reopened
         self.server.store = reopened
         self.assertEqual(reopened.get(job["id"])["state"], "interrupted")
@@ -141,7 +168,7 @@ class WebAppTests(unittest.TestCase):
         release_request = threading.Event()
         calls = []
 
-        def generate(text, key, model, voice):
+        def generate(text, voice):
             calls.append(text)
             if len(calls) == 2:
                 in_request.set()
@@ -150,7 +177,6 @@ class WebAppTests(unittest.TestCase):
             return wav_bytes(8)
 
         self.store.generator = generate
-        self.store.key_loader = lambda: ["backup"]
         job = self.store.create("cancel.md", "A lesson in stopping and resuming. " * 150)
         self.assertTrue(in_request.wait(5))
         try:
@@ -176,7 +202,7 @@ class WebAppTests(unittest.TestCase):
         release_request = threading.Event()
         calls = []
 
-        def generate(text, key, model, voice):
+        def generate(text, voice):
             calls.append(text)
             if len(calls) == 1:
                 in_request.set()
@@ -185,7 +211,6 @@ class WebAppTests(unittest.TestCase):
             return wav_bytes(9)
 
         self.store.generator = generate
-        self.store.key_loader = lambda: ["backup"]
         first = self.store.create("first.md", "First recording.")
         self.assertTrue(in_request.wait(5))
         try:

@@ -1,2 +1,10 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 markdown-it-py>=4.0,<5
-python-dotenv>=1.0,<2
+piper-tts==1.8.0
+stable-ts==2.19.1
+openai-whisper==20250625
+torch==2.8.0
+torchaudio==2.8.0+cpu
+numpy>=1.26,<2
+scipy>=1.13,<2
+requests>=2.32,<3

@@ -1,46 +1,25 @@
-"""Convert Markdown prose to a resumable WAV recording with Gemini TTS."""
+"""Convert Markdown prose to a resumable WAV recording with local Python TTS."""
 
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import io
 import json
-import os
 import re
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
 import wave
 from pathlib import Path
 from typing import Callable
 
-from dotenv import load_dotenv
 from markdown_it import MarkdownIt
+from audio_errors import ConversionCancelled, SynthesisError
+from local_audio import DEFAULT_MODEL, DEFAULT_VOICE
 
 
-DEFAULT_MODEL = "gemini-3.8-flash-lite-tts"
-API_ROOT = "https://generativelanguage.googleapis.com/v1beta/models"
 SPEECH_STYLE = "clear, conversational explanation"
-
-
-class QuotaError(Exception):
-    """The current API key's project is rate limited or out of quota."""
-
-
-class KeyUnavailableError(Exception):
-    """The current API key cannot access the model."""
-
-
-class SynthesisError(Exception):
-    """Audio generation failed for a reason key rotation cannot resolve."""
-
-
-class ConversionCancelled(SynthesisError):
-    """The user stopped generation; completed audio segments remain saved."""
 
 
 def _spoken_code(value: str) -> str:
@@ -241,64 +220,15 @@ def _wav_params(data: bytes) -> tuple[wave._wave_params, bytes]:
             params = reader.getparams()
             frames = reader.readframes(params.nframes)
     except (EOFError, wave.Error) as exc:
-        raise SynthesisError("Gemini returned invalid WAV audio") from exc
+        raise SynthesisError("Generated WAV audio is invalid") from exc
     if not frames or params.comptype != "NONE":
-        raise SynthesisError("Gemini returned empty or compressed WAV audio")
+        raise SynthesisError("Generated WAV audio is empty or compressed")
     return params, frames
 
 
-def synthesize(text: str, key: str, model: str, voice: str, timeout: int = 120,
-               cancelled: Callable[[], bool] | None = None) -> bytes:
-    """Call Gemini's unary TTS endpoint and return a complete WAV file."""
-    payload = {
-        "contents": [{"role": "user", "parts": [{
-            "text": text,
-            "speech_metadata": {"style": SPEECH_STYLE},
-        }]}],
-        "generationConfig": {
-            "responseModalities": ["AUDIO"],
-            "responseFormat": {"audio": {"mimeType": "AUDIO_WAV"}},
-            "speechConfig": {"voiceConfig": {"voice": voice}},
-        },
-    }
-    request = urllib.request.Request(
-        f"{API_ROOT}/{model}:generateContent",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "x-goog-api-key": key},
-        method="POST",
-    )
-    for attempt in range(3):
-        if cancelled and cancelled():
-            raise ConversionCancelled("Recording cancelled. Completed segments remain saved.")
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                body = json.load(response)
-            parts = body["candidates"][0]["content"]["parts"]
-            audio = next(part["inlineData"]["data"] for part in parts if "inlineData" in part)
-            data = base64.b64decode(audio, validate=True)
-            _wav_params(data)
-            return data
-        except urllib.error.HTTPError as exc:
-            if exc.code == 429:
-                raise QuotaError("Gemini quota or rate limit reached (HTTP 429)") from None
-            if exc.code in (401, 403):
-                raise KeyUnavailableError(f"Gemini rejected this key (HTTP {exc.code})") from None
-            if exc.code in (500, 502, 503, 504) and attempt < 2:
-                if cancelled and cancelled():
-                    raise ConversionCancelled("Recording cancelled. Completed segments remain saved.") from None
-                time.sleep(2 ** attempt)
-                continue
-            raise SynthesisError(f"Gemini request failed (HTTP {exc.code})") from None
-        except (urllib.error.URLError, TimeoutError) as exc:
-            if cancelled and cancelled():
-                raise ConversionCancelled("Recording cancelled. Completed segments remain saved.") from None
-            if attempt < 2:
-                time.sleep(2 ** attempt)
-                continue
-            raise SynthesisError(f"Network error: {exc.reason if hasattr(exc, 'reason') else exc}") from None
-        except (KeyError, IndexError, StopIteration, ValueError) as exc:
-            raise SynthesisError("Gemini response did not contain valid WAV audio") from exc
-    raise SynthesisError("Gemini request failed after retries")
+def synthesize(text: str, voice: str = DEFAULT_VOICE, *, cancelled=None, progress=lambda message: None) -> bytes:
+    from local_audio import synthesize as local_speech
+    return local_speech(text, voice, cancelled=cancelled, progress=progress)
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -341,14 +271,9 @@ def _join_wavs(files: list[Path], output: Path, check_cancel: Callable[[], None]
 
 
 def convert(
-    input_path: Path,
-    output_path: Path,
-    keys: list[str],
-    *,
-    model: str = DEFAULT_MODEL,
-    voice: str = "Kore",
-    max_chars: int = 1500,
-    generator: Callable[[str, str, str, str], bytes] = synthesize,
+    input_path: Path, output_path: Path, *, model: str = DEFAULT_MODEL,
+    voice: str = DEFAULT_VOICE, max_chars: int = 1500,
+    generator: Callable[[str, str], bytes] = synthesize,
     progress: Callable[[dict], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> Path:
@@ -362,21 +287,19 @@ def convert(
         else:
             print(message)
 
-    if not keys:
-        raise ValueError("No Gemini API keys configured")
+    if model != DEFAULT_MODEL:
+        raise ValueError("Choose the local Piper speech engine")
     if input_path.suffix.lower() != ".md":
         raise ValueError("Input must be a .md file")
     if output_path.suffix.lower() != ".wav":
         raise ValueError("Output must be a .wav file")
+    check_cancel()
     text = markdown_text(input_path.read_text(encoding="utf-8"))
     chunks, files = segment_plan(text, output_path, model, voice, max_chars)
     if not chunks:
         raise ValueError("No readable text found in the Markdown file")
     files[0].parent.mkdir(parents=True, exist_ok=True)
-    key_index = 0
-    unavailable: set[int] = set()
-    report("planned", f"Preparing {len(chunks)} audio segments", total=len(chunks), completed=0)
-
+    report("planned", f"Preparing {len(chunks)} local audio segments", total=len(chunks), completed=0)
     for number, (chunk, path) in enumerate(zip(chunks, files), 1):
         check_cancel()
         if path.exists():
@@ -386,36 +309,19 @@ def convert(
                 continue
             except SynthesisError:
                 path.unlink()
-        while len(unavailable) < len(keys):
+        report("generating", f"[{number}/{len(chunks)}] Generating audio locally", segment=number, total=len(chunks))
+        try:
+            if generator is synthesize:
+                data = generator(chunk, voice, cancelled=cancelled, progress=lambda message: report("setup", message))
+            else:
+                data = generator(chunk, voice)
+        except Exception:
             check_cancel()
-            if key_index in unavailable:
-                key_index = (key_index + 1) % len(keys)
-                continue
-            report("generating", f"[{number}/{len(chunks)}] Generating audio", segment=number, total=len(chunks), key=key_index + 1)
-            try:
-                try:
-                    if generator is synthesize:
-                        data = generator(chunk, keys[key_index], model, voice, cancelled=cancelled)
-                    else:
-                        data = generator(chunk, keys[key_index], model, voice)
-                except Exception:
-                    check_cancel()
-                    raise
-                _wav_params(data)
-                _atomic_write(path, data)
-                report("saved", f"[{number}/{len(chunks)}] Segment saved", completed=number, total=len(chunks))
-                check_cancel()
-                break
-            except (QuotaError, KeyUnavailableError) as exc:
-                report("key_switch", f"Key {key_index + 1}: {exc}; switching keys", key=key_index + 1)
-                unavailable.add(key_index)
-                key_index = (key_index + 1) % len(keys)
-        else:
-            raise SynthesisError(
-                "All configured keys are unavailable. Saved segments remain; rerun later to resume."
-            )
-
-    check_cancel()
+            raise
+        _wav_params(data)
+        _atomic_write(path, data)
+        report("saved", f"[{number}/{len(chunks)}] Segment saved", completed=number, total=len(chunks))
+        check_cancel()
     report("assembling", "Combining saved segments into your recording", completed=len(chunks), total=len(chunks))
     _join_wavs(files, output_path, check_cancel)
     check_cancel()
@@ -424,14 +330,13 @@ def convert(
 
 
 def main(argv: list[str] | None = None) -> int:
-    load_dotenv()
     parser = argparse.ArgumentParser(description="Convert Markdown text to a local WAV recording")
     parser.add_argument("input", type=Path, help="Markdown file to narrate")
     parser.add_argument("-o", "--output", type=Path, help="Output WAV path (default: beside input)")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Gemini TTS model")
-    parser.add_argument("--voice", default="Kore", help="Gemini voice name")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Local speech engine")
+    parser.add_argument("--voice", default=DEFAULT_VOICE, help="Local Piper voice name")
     parser.add_argument("--max-chars", type=int, default=1500, help="Maximum characters per segment")
-    parser.add_argument("--preview-text", action="store_true", help="Print narration text without calling Gemini")
+    parser.add_argument("--preview-text", action="store_true", help="Print narration text without generating audio")
     args = parser.parse_args(argv)
     if args.preview_text:
         try:
@@ -446,12 +351,9 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
-    keys = [key.strip() for key in os.getenv("GEMINI_API_KEYS", "").split(",") if key.strip()]
-    if not keys and os.getenv("GEMINI_API_KEY"):
-        keys = [os.environ["GEMINI_API_KEY"].strip()]
     output = args.output or args.input.with_suffix(".wav")
     try:
-        convert(args.input, output, keys, model=args.model, voice=args.voice, max_chars=args.max_chars)
+        convert(args.input, output, model=args.model, voice=args.voice, max_chars=args.max_chars)
     except (OSError, ValueError, SynthesisError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

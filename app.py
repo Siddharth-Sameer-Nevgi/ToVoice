@@ -7,7 +7,6 @@ import hashlib
 import json
 import logging
 import mimetypes
-import os
 import re
 import threading
 import uuid
@@ -18,21 +17,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from dotenv import dotenv_values
 import readalong
+import local_audio
 
 from md_to_audio import ConversionCancelled, DEFAULT_MODEL, SPEECH_STYLE, _atomic_write, convert, markdown_text, split_chunks, synthesize
 
 
 ROOT = Path(__file__).resolve().parent
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
-VOICES = ("Kore", "Puck", "Aoede", "Charon", "Fenrir", "Leda", "Orus", "Zephyr")
-
-
-def configured_keys() -> list[str]:
-    config = {**dotenv_values(ROOT / ".env"), **os.environ}
-    raw = config.get("GEMINI_API_KEYS") or config.get("GEMINI_API_KEY") or ""
-    return list(dict.fromkeys(key.strip() for key in raw.split(",") if key.strip()))
+VOICES = local_audio.VOICES
 
 
 def timestamp() -> str:
@@ -40,12 +33,11 @@ def timestamp() -> str:
 
 
 class JobStore:
-    def __init__(self, directory: Path, key_loader=configured_keys, generator=synthesize, transcriber=readalong.transcribe_words):
+    def __init__(self, directory: Path, generator=synthesize, aligner=readalong.align_words):
         self.directory = directory
         self.directory.mkdir(parents=True, exist_ok=True)
-        self.key_loader = key_loader
         self.generator = generator
-        self.transcriber = transcriber
+        self.aligner = aligner
         self.lock = threading.RLock()
         self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tovoice")
         self.sync_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="readalong")
@@ -61,6 +53,13 @@ class JobStore:
                     job.update(state="cancelled", error=None, message="Recording cancelled. Saved segments are kept for resuming.")
                 if job.get("sync_state") in {"queued", "running"}:
                     job["sync_state"] = "waiting"
+                elif job.get("sync_state") == "ready" and job.get("alignment_engine") != local_audio.ALIGNMENT_ENGINE:
+                    job.update(sync_state="waiting", sync_completed=0, sync_error=None)
+                if job["model"] != DEFAULT_MODEL and job["state"] != "complete":
+                    job.update(needs_local_restart=True, error=None,
+                               message="This recording used a previous voice. Create locally to restart with an offline voice; saved files are kept.")
+                else:
+                    job.setdefault("needs_local_restart", False)
                 self.jobs[job["id"]] = job
             except (OSError, ValueError, KeyError):
                 logging.warning("Could not load job metadata from %s", path)
@@ -78,7 +77,7 @@ class JobStore:
         with self.lock:
             return [dict(job) for job in sorted(self.jobs.values(), key=lambda item: item["created_at"], reverse=True)]
 
-    def create(self, filename: str, source: str, voice: str = "Kore") -> dict:
+    def create(self, filename: str, source: str, voice: str = local_audio.DEFAULT_VOICE) -> dict:
         filename = re.split(r"[\\/]", filename)[-1]
         if not filename.lower().endswith(".md"):
             raise ValueError("Choose a Markdown (.md) file.")
@@ -110,7 +109,7 @@ class JobStore:
                 "voice": voice, "model": DEFAULT_MODEL, "state": "queued",
                 "created_at": timestamp(), "completed": 0, "total": len(chunks),
                 "words": len(narration.split()), "characters": len(narration),
-                "key_switches": 0, "message": "Waiting to generate audio",
+                "message": "Waiting to generate audio locally", "needs_local_restart": False,
                 "output_path": str((folder / f"{safe_stem}.wav").resolve()),
                 "error": None,
                 "sync_state": "waiting", "sync_completed": 0, "sync_error": None,
@@ -134,7 +133,7 @@ class JobStore:
                     self._mark_cancelled(job)
                 else:
                     job.update(state="cancelling", error=None,
-                               message="Cancelling after the current request finishes. No further segments will start.")
+                               message="Cancelling local generation. Completed segments are kept.")
                     self._save(job)
             return dict(job)
 
@@ -148,6 +147,14 @@ class JobStore:
             job = self.jobs[job_id]
             if job["state"] in {"queued", "running", "cancelling", "complete"}:
                 return dict(job)
+            if job.get("needs_local_restart"):
+                previous_output = Path(job["output_path"])
+                narration = (self.directory / job_id / "narration.txt").read_text(encoding="utf-8")
+                job.update(model=DEFAULT_MODEL, voice=local_audio.DEFAULT_VOICE, completed=0,
+                           previous_output_path=str(previous_output),
+                           output_path=str(previous_output.with_name(previous_output.stem + "-local.wav")),
+                           needs_local_restart=False, sync_state="waiting", sync_completed=0, sync_error=None,
+                           fingerprint=hashlib.sha256(json.dumps([narration, local_audio.DEFAULT_VOICE, DEFAULT_MODEL, SPEECH_STYLE]).encode()).hexdigest())
             job.update(state="queued", error=None, message="Resuming from saved audio segments")
             self._save(job)
             self._submit(job_id)
@@ -163,10 +170,6 @@ class JobStore:
                     job["completed"] = event["completed"]
                 if "total" in event:
                     job["total"] = event["total"]
-                if "key" in event:
-                    job["active_key"] = event["key"]
-                if event["event"] == "key_switch":
-                    job["key_switches"] += 1
                 self._save(job)
 
         with self.lock:
@@ -176,10 +179,7 @@ class JobStore:
             job.update(state="running", message="Preparing your narration")
             self._save(job)
         try:
-            keys = self.key_loader()
-            if not keys:
-                raise ValueError("Add your Gemini API keys to the project's .env file, then click Resume.")
-            convert(self.directory / job_id / "input.md", Path(job["output_path"]), keys,
+            convert(self.directory / job_id / "input.md", Path(job["output_path"]),
                     voice=job["voice"], model=job["model"], generator=self.generator, progress=progress,
                     cancelled=cancel_event.is_set)
             with self.lock:
@@ -206,7 +206,7 @@ class JobStore:
         with self.lock:
             job = self.jobs[job_id]
             state = job.get("sync_state", "waiting")
-            if self.transcriber and job["state"] == "complete" and state not in {"queued", "running"} and (state not in {"failed", "ready"} or retry):
+            if self.aligner and job["state"] == "complete" and state not in {"queued", "running"} and (state not in {"failed", "ready"} or retry):
                 job.update(sync_state="queued", sync_error=None, sync_message="Preparing synchronized highlights")
                 self.readalong_cache.pop(job_id, None)
                 self._save(job)
@@ -214,6 +214,11 @@ class JobStore:
             return dict(job)
 
     def _run_sync(self, job_id: str) -> None:
+        def status(message):
+            with self.lock:
+                job["sync_message"] = message
+                self._save(job)
+
         def progress(number):
             with self.lock:
                 job.update(sync_completed=number, sync_message=f"Preparing highlights: {number} of {job['total']} segments")
@@ -226,9 +231,9 @@ class JobStore:
             self._save(job)
         try:
             source = (self.directory / job_id / "input.md").read_text(encoding="utf-8")
-            readalong.prepare(source, Path(job["output_path"]), job["model"], job["voice"], self.key_loader(), self.transcriber, progress)
+            readalong.prepare(source, Path(job["output_path"]), job["model"], job["voice"], self.aligner, progress, status)
             with self.lock:
-                job.update(sync_state="ready", sync_error=None, sync_message="Synchronized highlights ready")
+                job.update(sync_state="ready", sync_error=None, sync_message="Synchronized highlights ready", alignment_engine=local_audio.ALIGNMENT_ENGINE)
                 self.readalong_cache.pop(job_id, None)
                 self._save(job)
         except Exception as exc:
@@ -300,7 +305,8 @@ class Handler(BaseHTTPRequestHandler):
         route = urlsplit(self.path).path
         try:
             if route == "/api/config":
-                self._json({"key_count": len(self.server.store.key_loader()), "voices": VOICES, "model": DEFAULT_MODEL})
+                self._json({"engine": "local", "voices": VOICES, "voice_labels": local_audio.VOICE_LABELS,
+                            "model": DEFAULT_MODEL, "ready": local_audio.models_ready()})
             elif route == "/api/jobs":
                 self._json({"jobs": self.server.store.list()})
             elif re.fullmatch(r"/api/jobs/[a-f0-9]{32}", route):
@@ -378,7 +384,7 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/api/jobs":
                 if not isinstance(data.get("filename"), str) or not isinstance(data.get("source"), str):
                     raise ValueError("A Markdown filename and text are required.")
-                self._json(self.server.store.create(data["filename"], data["source"], data.get("voice", "Kore")), 201)
+                self._json(self.server.store.create(data["filename"], data["source"], data.get("voice", local_audio.DEFAULT_VOICE)), 201)
             elif re.fullmatch(r"/api/jobs/[a-f0-9]{32}/resume", route):
                 self._json(self.server.store.resume(route.split("/")[3]))
             elif re.fullmatch(r"/api/jobs/[a-f0-9]{32}/cancel", route):

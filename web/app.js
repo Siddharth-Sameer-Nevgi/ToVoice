@@ -4,7 +4,6 @@ let activeId = localStorage.getItem('tovoice-active');
 let currentAudio = null;
 let transcriptId = null;
 let uploading = false;
-let keyCount = 0;
 let libraryStamp = '';
 let cancelRequestId = null;
 let readalongData = null;
@@ -19,7 +18,8 @@ let readerFrame = null;
 let readalongLoadingId = null;
 
 const statuses = { queued: 'In the queue', running: 'Creating audio', cancelling: 'Cancelling…', cancelled: 'Cancelled', complete: 'Ready to listen', failed: 'Paused', interrupted: 'Resume available' };
-const voiceLabels = { Kore: 'Balanced', Puck: 'Upbeat', Aoede: 'Breezy', Charon: 'Informative', Fenrir: 'Excitable', Leda: 'Youthful', Orus: 'Firm', Zephyr: 'Bright' };
+let voiceLabels = {'en_US-lessac-medium':'Lessac · Clear narrator','en_US-amy-medium':'Amy · Gentle narrator','en_US-ryan-medium':'Ryan · Steady narrator'};
+const voiceName = voice => (voiceLabels[voice] || voice).split(' · ')[0];
 
 async function api(url, options = {}) {
   const response = await fetch(url, options);
@@ -45,7 +45,7 @@ async function refresh() {
   try {
     const result = await api('/api/jobs');
     jobs = result.jobs;
-    connection(keyCount > 0, keyCount ? `${keyCount} Gemini keys configured` : 'Add Gemini keys in .env');
+    connection(true, 'Local Python processing');
     if (!jobs.some(job => job.id === activeId)) activeId = jobs[0]?.id || null;
     renderLibrary();
     renderActive();
@@ -77,7 +77,7 @@ function renderLibrary() {
     name.textContent = job.filename;
     const details = document.createElement('small');
     const date = new Date(job.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-    details.textContent = `${job.voice} voice · ${job.words.toLocaleString()} words · ${date}`;
+    details.textContent = `${voiceName(job.voice)} voice · ${job.words.toLocaleString()} words · ${date}`;
     info.append(name, details);
     const badge = document.createElement('span');
     badge.className = `status-badge ${job.state}`;
@@ -107,7 +107,7 @@ function renderActive() {
   $('job-progress').hidden = !job;
   if (!job) return;
   $('job-filename').textContent = job.filename;
-  $('job-details').textContent = `${job.words.toLocaleString()} words · ${job.voice} voice`;
+  $('job-details').textContent = `${job.words.toLocaleString()} words · ${voiceName(job.voice)} voice`;
   $('job-badge').className = `status-badge ${job.state}`;
   $('job-badge').textContent = statuses[job.state];
   const percent = job.state === 'complete' ? 100 : Math.floor(job.completed / job.total * 100);
@@ -115,10 +115,11 @@ function renderActive() {
   $('progress-bar').value = percent;
   $('progress-label').textContent = job.message;
   $('segments').textContent = `${job.completed} of ${job.total} segments saved`;
-  $('key-info').textContent = job.key_switches ? `${job.key_switches} backup switch${job.key_switches === 1 ? '' : 'es'}` : 'Automatic backup keys';
+  $('engine-info').textContent = 'Processed on this computer';
   $('job-error').hidden = !job.error;
   $('job-error').textContent = job.error || '';
   $('resume-button').hidden = !['failed', 'interrupted', 'cancelled'].includes(job.state);
+  $('resume-button').textContent = job.needs_local_restart ? 'Create locally ↗' : 'Resume recording ↗';
   $('cancel-button').hidden = !['queued', 'running', 'cancelling'].includes(job.state);
   $('cancel-button').disabled = job.state === 'cancelling' || cancelRequestId === job.id;
   $('cancel-button').textContent = job.state === 'cancelling' || cancelRequestId === job.id ? 'Cancelling…' : 'Cancel recording';
@@ -186,7 +187,7 @@ function updateReadAlong(job) {
 function updateSyncStatus(job, data) {
   $('retry-sync').hidden = !['failed', 'ready'].includes(data.sync_state) || data.precision === 'word' || job.state !== 'complete';
   if (job.state !== 'complete') {
-    $('sync-status').textContent = 'Your Markdown is ready to follow when the recording finishes.';
+    $('sync-status').textContent = job.needs_local_restart ? 'Create a local recording to listen with highlights. Your previous files remain saved.' : 'Your Markdown is ready to follow when the local recording finishes.';
   } else if (data.precision === 'word') {
     $('sync-status').textContent = 'Synchronized to spoken words. Your original Markdown text is preserved.';
   } else if (data.sync_state === 'failed') {
@@ -194,7 +195,7 @@ function updateSyncStatus(job, data) {
   } else if (data.sync_state === 'ready') {
     $('sync-status').textContent = 'Some word timings are missing. Retry highlighting to restore them. Larger sections still highlight with the audio.';
   } else {
-    $('sync-status').textContent = `Preparing word highlights (${data.aligned_segments} / ${data.total_segments}). Larger sections highlight until their word timings are ready.`;
+    $('sync-status').textContent = `Preparing highlights locally (${data.aligned_segments} / ${data.total_segments}). Larger sections highlight until their word timings are ready.`;
   }
 }
 
@@ -398,7 +399,7 @@ $('cancel-button').addEventListener('click', async () => {
     jobs = jobs.map(job => job.id === jobId ? updated : job);
     renderLibrary();
     renderActive();
-    toast(updated.state === 'cancelling' ? 'Cancellation requested. The current request may finish; saved segments will be kept.' : updated.state === 'cancelled' ? 'Recording cancelled. Saved segments are kept.' : 'This recording has already finished.');
+    toast(updated.state === 'cancelling' ? 'Stopping local generation. Saved segments will be kept.' : updated.state === 'cancelled' ? 'Recording cancelled. Saved segments are kept.' : 'This recording has already finished.');
   } catch (error) { toast(error.message); }
   finally { cancelRequestId = null; renderActive(); }
 });
@@ -406,15 +407,15 @@ $('cancel-button').addEventListener('click', async () => {
 async function initialize() {
   try {
     const config = await api('/api/config');
+    voiceLabels = config.voice_labels || voiceLabels;
     $('voice').replaceChildren();
     for (const voice of config.voices) {
       const option = document.createElement('option');
       option.value = voice;
-      option.textContent = `${voice} · ${voiceLabels[voice] || 'Narrator'}`;
+      option.textContent = voiceLabels[voice] || voice;
       $('voice').append(option);
     }
-    keyCount = config.key_count;
-    connection(keyCount > 0, keyCount ? `${keyCount} Gemini keys configured` : 'Add Gemini keys in .env');
+    connection(true, 'Local Python processing');
   } catch (error) { connection(false, 'Local server unavailable'); }
   await refresh();
   setInterval(refresh, 1500);

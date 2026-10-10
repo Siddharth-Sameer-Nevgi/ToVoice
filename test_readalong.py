@@ -5,7 +5,8 @@ import wave
 from pathlib import Path
 
 import readalong
-from md_to_audio import DEFAULT_MODEL, QuotaError, SynthesisError, convert, markdown_blocks, markdown_text, split_chunks
+from local_audio import DEFAULT_VOICE
+from md_to_audio import DEFAULT_MODEL, SynthesisError, convert, markdown_blocks, markdown_text, split_chunks
 
 
 def audio_fixture(duration):
@@ -42,7 +43,7 @@ class ReadAlongTests(unittest.TestCase):
         identifier_range = cues[-1]["ranges"][0]
         self.assertEqual(block["text"][identifier_range["source_start"]:identifier_range["source_end"]], "userId.")
 
-    def test_exact_segment_offsets_cached_word_timings_and_key_failover(self):
+    def test_exact_segment_offsets_and_cached_local_alignment_resume(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as folder:
             source = "# Heading\n\n" + "Alpha beta gamma. " * 120
             input_path, output = Path(folder) / "story.md", Path(folder) / "story.wav"
@@ -55,44 +56,42 @@ class ReadAlongTests(unittest.TestCase):
                 audio_calls.append(args[0])
                 return audio_fixture(len(audio_calls))
 
-            convert(input_path, output, ["good"], generator=generate, progress=lambda value: None)
-            coarse = readalong.document(source, output, DEFAULT_MODEL, "Kore")
+            convert(input_path, output, generator=generate, progress=lambda value: None)
+            coarse = readalong.document(source, output, DEFAULT_MODEL, DEFAULT_VOICE)
             self.assertEqual(coarse["precision"], "segment")
             self.assertEqual(coarse["cues"][1]["start"], 1)
             calls = []
 
-            def exhausted(audio, key):
-                calls.append(key)
-                if key == "limited" or len(calls) == 3:
-                    raise QuotaError("limit")
+            def interrupted(audio, text):
+                calls.append(text)
+                if len(calls) == 2:
+                    raise SynthesisError("local alignment interruption")
                 return word_fixture(chunks[0], 1)
 
             with self.assertRaises(SynthesisError):
-                readalong.prepare(source, output, DEFAULT_MODEL, "Kore", ["limited", "backup"], exhausted)
-            self.assertEqual(calls, ["limited", "backup", "backup"])
-            self.assertEqual(readalong.document(source, output, DEFAULT_MODEL, "Kore")["precision"], "mixed")
+                readalong.prepare(source, output, DEFAULT_MODEL, DEFAULT_VOICE, aligner=interrupted)
+            self.assertEqual(calls, chunks)
+            self.assertEqual(readalong.document(source, output, DEFAULT_MODEL, DEFAULT_VOICE)["precision"], "mixed")
             retry_calls = []
 
-            def retry(audio, key):
-                retry_calls.append(key)
+            def retry(audio, text):
+                retry_calls.append(text)
                 return word_fixture(chunks[1], 2)
 
-            readalong.prepare(source, output, DEFAULT_MODEL, "Kore", ["fresh"], retry)
-            final = readalong.document(source, output, DEFAULT_MODEL, "Kore")
+            readalong.prepare(source, output, DEFAULT_MODEL, DEFAULT_VOICE, aligner=retry)
+            final = readalong.document(source, output, DEFAULT_MODEL, DEFAULT_VOICE)
             self.assertEqual(final["precision"], "word")
-            self.assertEqual(retry_calls, ["fresh"])
+            self.assertEqual(retry_calls, [chunks[1]])
             self.assertEqual(len(audio_calls), 2)
             self.assertAlmostEqual(final["duration"], 3)
             self.assertAlmostEqual(final["cues"][len(chunks[0].split())]["start"], 1.05)
             self.assertTrue(all(0 <= cue["start"] < cue["end"] <= 3 for cue in final["cues"]))
 
-    def test_parses_measured_offsets_and_rejects_unrelated_transcription(self):
-        body = {"steps": [{"content": [{"annotations": [
-            {"type": "word_info", "text": "Hello", "start_offset": "0.100s", "end_offset": "0.450s"},
-            {"type": "word_info", "text": "world", "start_offset": "0.500s", "end_offset": "0.850s"},
-        ]}]}]}
-        words = readalong.parse_timestamps(body)
-        self.assertEqual(words[1]["start"], 0.5)
+    def test_rejects_invalid_timing_and_unrelated_alignment(self):
+        self.assertEqual(readalong.seconds("0.5s"), 0.5)
+        with self.assertRaises(ValueError):
+            readalong.seconds("nan")
+        words = [{"text":"Hello", "start":0.1, "end":0.45}, {"text":"world", "start":0.5, "end":0.85}]
         with self.assertRaises(SynthesisError):
             readalong.map_word_cues("An unrelated transcript.", words, [], 0, 0, 1)
 
