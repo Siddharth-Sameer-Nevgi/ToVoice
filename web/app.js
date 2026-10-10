@@ -7,6 +7,16 @@ let uploading = false;
 let keyCount = 0;
 let libraryStamp = '';
 let cancelRequestId = null;
+let readalongData = null;
+let readalongId = null;
+let readalongRevision = '';
+let readerMode = localStorage.getItem('tovoice-text-mode') || 'source';
+let readerNodes = new Map();
+let highlighted = [];
+let highlightedBlocks = [];
+let currentCue = null;
+let readerFrame = null;
+let readalongLoadingId = null;
 
 const statuses = { queued: 'In the queue', running: 'Creating audio', cancelling: 'Cancelling…', cancelled: 'Cancelled', complete: 'Ready to listen', failed: 'Paused', interrupted: 'Resume available' };
 const voiceLabels = { Kore: 'Balanced', Puck: 'Upbeat', Aoede: 'Breezy', Charon: 'Informative', Fenrir: 'Excitable', Leda: 'Youthful', Orus: 'Firm', Zephyr: 'Bright' };
@@ -137,7 +147,203 @@ function renderActive() {
       if (transcriptId === job.id) $('transcript-text').textContent = text;
     }).catch(error => { $('transcript-text').textContent = error.message; });
   }
+  updateReadAlong(job);
 }
+
+function updateReadAlong(job) {
+  $('readalong-panel').hidden = false;
+  $('readalong-filename').textContent = job.filename;
+  $('reader-play').disabled = job.state !== 'complete';
+  const revision = JSON.stringify([job.id, job.state, job.completed, job.sync_state, job.sync_completed]);
+  if (readalongId !== job.id) {
+    readalongId = job.id;
+    readalongData = null;
+    readalongRevision = '';
+    clearHighlights();
+    $('readalong-text').replaceChildren();
+    $('sync-status').textContent = 'Loading your Markdown…';
+    $('retry-sync').hidden = true;
+  }
+  if (revision !== readalongRevision && readalongLoadingId !== job.id) {
+    const id = job.id;
+    readalongLoadingId = id;
+    api(`/api/jobs/${id}/readalong`).then(data => {
+      if (activeId !== id) return;
+      const firstLoad = !readalongData;
+      readalongData = data;
+      readalongRevision = revision;
+      if (firstLoad) renderReaderText();
+      updateSyncStatus(job, data);
+      clearHighlights();
+      updateHighlight();
+    }).catch(error => {
+      if (activeId === id) $('sync-status').textContent = error.message;
+    }).finally(() => { if (readalongLoadingId === id) readalongLoadingId = null; });
+  }
+  updateReaderControls();
+}
+
+function updateSyncStatus(job, data) {
+  $('retry-sync').hidden = !['failed', 'ready'].includes(data.sync_state) || data.precision === 'word' || job.state !== 'complete';
+  if (job.state !== 'complete') {
+    $('sync-status').textContent = 'Your Markdown is ready to follow when the recording finishes.';
+  } else if (data.precision === 'word') {
+    $('sync-status').textContent = 'Synchronized to spoken words. Your original Markdown text is preserved.';
+  } else if (data.sync_state === 'failed') {
+    $('sync-status').textContent = `${data.sync_error || 'Word highlighting is unavailable.'} Segment highlights remain available.`;
+  } else if (data.sync_state === 'ready') {
+    $('sync-status').textContent = 'Some word timings are missing. Retry highlighting to restore them. Larger sections still highlight with the audio.';
+  } else {
+    $('sync-status').textContent = `Preparing word highlights (${data.aligned_segments} / ${data.total_segments}). Larger sections highlight until their word timings are ready.`;
+  }
+}
+
+function renderReaderText() {
+  clearHighlights();
+  readerNodes = new Map();
+  $('readalong-text').replaceChildren();
+  $('source-mode').classList.toggle('selected', readerMode === 'source');
+  $('narration-mode').classList.toggle('selected', readerMode === 'narration');
+  $('source-mode').setAttribute('aria-pressed', readerMode === 'source');
+  $('narration-mode').setAttribute('aria-pressed', readerMode === 'narration');
+  if (!readalongData) return;
+  const fragment = document.createDocumentFragment();
+  for (const block of readalongData.blocks) {
+    const section = document.createElement('div');
+    section.className = `reader-block reader-${block.kind}`;
+    section.dataset.block = block.id;
+    section.tabIndex = 0;
+    section.title = `Markdown line ${block.line_start}. Click to play this passage.`;
+    const element = document.createElement(block.kind === 'heading' ? `h${Math.min(6, Math.max(2, block.level + 1))}` : 'p');
+    const text = readerMode === 'source' ? block.text : block.narration;
+    const words = [];
+    let cursor = 0;
+    for (const token of TovoiceTimeline.tokenize(text)) {
+      element.append(document.createTextNode(token.before));
+      const word = document.createElement('span');
+      word.className = 'reader-word';
+      word.textContent = token.text;
+      word.dataset.start = token.start;
+      word.dataset.end = token.end;
+      element.append(word);
+      words.push(word);
+      cursor = token.offsetEnd;
+    }
+    element.append(document.createTextNode(text.slice(cursor)));
+    section.append(element);
+    fragment.append(section);
+    readerNodes.set(block.id, {section, words});
+  }
+  $('readalong-text').append(fragment);
+  currentCue = null;
+  updateHighlight();
+}
+
+function clearHighlights() {
+  for (const element of highlighted) element.classList.remove('spoken-word');
+  for (const element of highlightedBlocks) element.classList.remove('spoken-block');
+  highlighted = [];
+  highlightedBlocks = [];
+  currentCue = null;
+}
+
+function updateHighlight() {
+  const audio = $('audio-player');
+  const cue = readalongData && currentAudio === activeId ? TovoiceTimeline.cueAt(readalongData.cues, audio.currentTime) : null;
+  updateReaderControls();
+  if (cue === currentCue) return;
+  clearHighlights();
+  currentCue = cue;
+  if (!cue) return;
+  for (const range of cue.ranges) {
+    const node = readerNodes.get(range.block);
+    if (!node) continue;
+    node.section.classList.add('spoken-block');
+    highlightedBlocks.push(node.section);
+    const begin = readerMode === 'source' ? range.source_start : range.narration_start;
+    const end = readerMode === 'source' ? range.source_end : range.narration_end;
+    for (const word of node.words) {
+      if (TovoiceTimeline.overlaps(Number(word.dataset.start), Number(word.dataset.end), begin, end)) {
+        word.classList.add('spoken-word');
+        highlighted.push(word);
+      }
+    }
+  }
+  const target = highlighted[0] || highlightedBlocks[0];
+  if (target && $('follow-audio').checked && !audio.paused) {
+    const rect = target.getBoundingClientRect();
+    const panel = $('readalong-text');
+    const bounds = panel.getBoundingClientRect();
+    if (rect.top < bounds.top + 20 || rect.bottom > bounds.bottom - 30) {
+      panel.scrollBy({top:rect.top - bounds.top - panel.clientHeight * 0.35, behavior:'smooth'});
+    }
+  }
+}
+
+function clock(seconds) {
+  if (!Number.isFinite(seconds)) return '0:00';
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
+}
+
+function updateReaderControls() {
+  const audio = $('audio-player');
+  $('reader-play').textContent = audio.paused ? 'Play audio' : 'Pause audio';
+  $('reader-clock').textContent = `${clock(audio.currentTime)} / ${clock(audio.duration || readalongData?.duration || 0)}`;
+}
+
+function readerTick() {
+  updateHighlight();
+  readerFrame = $('audio-player').paused ? null : requestAnimationFrame(readerTick);
+}
+
+function jumpToText(event) {
+  if (!readalongData || currentAudio !== activeId) return;
+  const block = event.target.closest('.reader-block');
+  if (!block) return;
+  const word = event.target.closest('.reader-word');
+  const cue = readalongData.cues.find(item => item.ranges.some(range => {
+    if (range.block !== Number(block.dataset.block)) return false;
+    const begin = readerMode === 'source' ? range.source_start : range.narration_start;
+    const end = readerMode === 'source' ? range.source_end : range.narration_end;
+    return !word || TovoiceTimeline.overlaps(Number(word.dataset.start), Number(word.dataset.end), begin, end);
+  }));
+  if (cue) {
+    $('audio-player').currentTime = cue.start;
+    updateHighlight();
+    $('audio-player').play().catch(error => toast(error.message));
+  }
+}
+
+for (const mode of ['source', 'narration']) $(`${mode}-mode`).addEventListener('click', () => {
+  readerMode = mode;
+  localStorage.setItem('tovoice-text-mode', mode);
+  renderReaderText();
+});
+$('readalong-text').addEventListener('click', jumpToText);
+$('readalong-text').addEventListener('keydown', event => {
+  if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); jumpToText(event); }
+});
+$('reader-play').addEventListener('click', () => {
+  const audio = $('audio-player');
+  if (audio.paused) audio.play().catch(error => toast(error.message));
+  else audio.pause();
+});
+$('audio-player').addEventListener('play', () => {
+  if (readerFrame !== null) cancelAnimationFrame(readerFrame);
+  readerTick();
+});
+for (const event of ['timeupdate', 'pause', 'seeking', 'seeked', 'ratechange', 'loadedmetadata', 'ended']) $('audio-player').addEventListener(event, updateHighlight);
+$('retry-sync').addEventListener('click', async () => {
+  const id = activeId;
+  $('retry-sync').disabled = true;
+  try {
+    await api(`/api/jobs/${id}/sync`, {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+    readalongRevision = '';
+    await refresh();
+  } catch (error) { toast(error.message); }
+  finally { $('retry-sync').disabled = false; }
+});
 
 async function upload(file) {
   if (!file || uploading) return;

@@ -111,17 +111,41 @@ def _inline_text(token) -> str:
     return _speech_clean("".join(pieces))
 
 
-def markdown_text(source: str) -> str:
-    """Keep readable prose while making inline notation speak naturally."""
-    source = re.sub(r"\A\ufeff?---\s*\n.*?\n---\s*(?:\n|\Z)", "", source, flags=re.S)
+def markdown_blocks(source: str) -> list[dict]:
+    """Pair source Markdown text with its spoken form and original line numbers."""
+    front = re.match(r"\A\ufeff?---\s*\n.*?\n---\s*(?:\n|\Z)", source, flags=re.S)
+    line_offset = source[:front.end()].count("\n") if front else 0
+    source = source[front.end():] if front else source
     parser = MarkdownIt("commonmark").enable("table")
-    blocks: list[str] = []
+    blocks: list[dict] = []
     in_table = False
     in_header = False
     headers: list[str] = []
     row: list[str] = []
+    display_row: list[str] = []
+    kind, level, quote_depth, list_depth = "paragraph", 0, 0, 0
+    lines = [1, 1]
+
+    def append(text: str, display: str, block_kind: str, block_level: int = 0) -> None:
+        if text and re.search(r"\w", text):
+            blocks.append({"id": len(blocks), "text": display or text, "narration": text,
+                           "kind": block_kind, "level": block_level,
+                           "line_start": lines[0] + line_offset, "line_end": lines[1] + line_offset})
+
     for token in parser.parse(source):
-        if token.type == "table_open":
+        if token.type == "heading_open":
+            kind, level = "heading", int(token.tag[1:])
+        elif token.type == "heading_close":
+            kind, level = "paragraph", 0
+        elif token.type == "blockquote_open":
+            quote_depth += 1
+        elif token.type == "blockquote_close":
+            quote_depth -= 1
+        elif token.type in {"bullet_list_open", "ordered_list_open"}:
+            list_depth += 1
+        elif token.type in {"bullet_list_close", "ordered_list_close"}:
+            list_depth -= 1
+        elif token.type == "table_open":
             in_table = True
         elif token.type == "table_close":
             in_table = False
@@ -131,6 +155,7 @@ def markdown_text(source: str) -> str:
             in_header = False
         elif token.type == "tr_open":
             row = []
+            display_row = []
         elif token.type == "tr_close" and in_table:
             if in_header:
                 headers = row
@@ -138,16 +163,36 @@ def markdown_text(source: str) -> str:
                 cells = [f"{headers[i]}: {cell}" if i < len(headers) and headers[i] else cell
                          for i, cell in enumerate(row) if cell]
                 if cells:
-                    blocks.append(". ".join(cells).rstrip(".") + ".")
+                    append(". ".join(cells).rstrip(".") + ".", " | ".join(display_row), "table")
         elif token.type != "inline":
             continue
         else:
             block = _inline_text(token)
+            display = re.sub(r"\s+", " ", "".join(
+                child.content if child.type in {"text", "code_inline"} else " "
+                if child.type in {"softbreak", "hardbreak"} else "" for child in token.children or []
+            )).strip()
+            if token.map:
+                lines = [token.map[0] + 1, token.map[1]]
             if in_table:
                 row.append(block)
+                display_row.append(display)
             elif block and re.search(r"\w", block):
-                blocks.append(block)
-    return "\n\n".join(blocks)
+                append(block, display, kind if kind == "heading" else "list" if list_depth else "quote" if quote_depth else "paragraph", level)
+    return blocks
+
+
+def markdown_text(source: str) -> str:
+    """Keep readable prose while making inline notation speak naturally."""
+    return "\n\n".join(block["narration"] for block in markdown_blocks(source))
+
+
+def segment_plan(text: str, output_path: Path, model: str, voice: str, max_chars: int = 1500) -> tuple[list[str], list[Path]]:
+    chunks = split_chunks(text, max_chars)
+    job = json.dumps({"chunks": chunks, "model": model, "voice": voice, "style": SPEECH_STYLE}, ensure_ascii=False)
+    job_id = hashlib.sha256(job.encode("utf-8")).hexdigest()[:16]
+    parts_dir = output_path.parent / f".{output_path.name}.parts" / job_id
+    return chunks, [parts_dir / f"{i:05d}.wav" for i in range(1, len(chunks) + 1)]
 
 
 def split_chunks(text: str, max_chars: int) -> list[str]:
@@ -324,14 +369,10 @@ def convert(
     if output_path.suffix.lower() != ".wav":
         raise ValueError("Output must be a .wav file")
     text = markdown_text(input_path.read_text(encoding="utf-8"))
-    chunks = split_chunks(text, max_chars)
+    chunks, files = segment_plan(text, output_path, model, voice, max_chars)
     if not chunks:
         raise ValueError("No readable text found in the Markdown file")
-    job = json.dumps({"chunks": chunks, "model": model, "voice": voice, "style": SPEECH_STYLE}, ensure_ascii=False)
-    job_id = hashlib.sha256(job.encode("utf-8")).hexdigest()[:16]
-    parts_dir = output_path.parent / f".{output_path.name}.parts" / job_id
-    parts_dir.mkdir(parents=True, exist_ok=True)
-    files = [parts_dir / f"{i:05d}.wav" for i in range(1, len(chunks) + 1)]
+    files[0].parent.mkdir(parents=True, exist_ok=True)
     key_index = 0
     unavailable: set[int] = set()
     report("planned", f"Preparing {len(chunks)} audio segments", total=len(chunks), completed=0)

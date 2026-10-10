@@ -6,6 +6,7 @@
   <meta name="theme-color" content="#7659e8">
   <title>Tovoice — turn your words into audio</title>
   <link rel="stylesheet" href="/styles.css">
+  <script src="/timeline.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -15,6 +16,7 @@
       <div class="nav-label">WORKSPACE</div>
       <nav aria-label="Main navigation">
         <a class="nav-item active" href="#studio"><svg viewBox="0 0 24 24"><path d="M4 8h4l5-4v16l-5-4H4zM17 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/></svg>Audio studio</a>
+        <a class="nav-item" href="#readalong-panel"><svg viewBox="0 0 24 24"><path d="M3 4h6c2 0 3 1 3 3v14c0-2-1-3-3-3H3zM21 4h-6c-2 0-3 1-3 3v14c0-2 1-3 3-3h6z"/></svg>Read along</a>
         <a class="nav-item" href="#library"><svg viewBox="0 0 24 24"><path d="M4 4h6v16H4zm10 0h6v16h-6zM6 8h2m8 0h2"/></svg>My recordings<span id="library-count" class="nav-count">0</span></a>
       </nav>
       <div class="sidebar-bottom">
@@ -59,6 +61,13 @@
 
         <div class="features"><div><span class="feature-icon"><svg viewBox="0 0 24 24"><path d="M4 5h16M4 10h10M4 15h7m6-3 2 2 4-5M4 20h16"/></svg></span><div><strong>Just the words that matter</strong><p>Formatting and symbols cleaned for speech.</p></div></div><div><span class="feature-icon"><svg viewBox="0 0 24 24"><path d="M20 7a8 8 0 1 0 0 10M20 3v4h-4M10 8v5l3 2"/></svg></span><div><strong>Picks up where it left off</strong><p>Saved segments survive pauses and retries.</p></div></div><div><span class="feature-icon"><svg viewBox="0 0 24 24"><path d="M4 4h14l2 2v14H4zM8 4v6h8V4M8 20v-6h8v6"/></svg></span><div><strong>Yours to keep</strong><p>A local WAV, ready to play or download.</p></div></div></div>
 
+        <section id="readalong-panel" class="readalong-panel panel" aria-labelledby="readalong-title" hidden>
+          <div class="readalong-heading"><div><h2 id="readalong-title">Read along</h2><p id="readalong-filename"></p></div><div class="reader-modes" aria-label="Text view"><button id="source-mode" class="selected" type="button" aria-pressed="true">Markdown text</button><button id="narration-mode" type="button" aria-pressed="false">Spoken text</button></div></div>
+          <div class="reader-toolbar"><button id="reader-play" class="primary-button" type="button" disabled>Play audio</button><span id="reader-clock">0:00 / 0:00</span><label><input id="follow-audio" type="checkbox" checked> Follow audio</label></div>
+          <div class="reader-status"><span id="sync-status" role="status">Preparing text…</span><button id="retry-sync" class="text-link" type="button" hidden>Retry highlighting</button></div>
+          <div id="readalong-text" class="readalong-text" aria-label="Text synchronized with the recording"></div>
+          <p class="reader-hint">Highlights follow playback. Click a word to jump to that part of the recording.</p>
+        </section>
         <section id="library" class="library" aria-labelledby="library-title"><div class="library-heading"><div><h2 id="library-title">Your recordings</h2><p>Everything you’ve brought to life.</p></div><span id="recording-count">0 recordings</span></div><div id="recordings-list" class="recordings-list"><div class="library-empty"><span class="library-empty-icon">♫</span><div><strong>Your listening library starts here</strong><p>Upload a document to make your first recording.</p></div><span class="empty-hint">Made for your ears.</span></div></div></section>
         <footer><span>Tovoice · A voice for every document</span><span>Made to listen.</span></footer>
       </div>

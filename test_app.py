@@ -23,7 +23,7 @@ class WebAppTests(unittest.TestCase):
                 raise QuotaError("quota reached")
             return wav_bytes(7)
 
-        self.store = JobStore(Path(self.temp.name) / "jobs", lambda: ["limited", "backup"], generate)
+        self.store = JobStore(Path(self.temp.name) / "jobs", lambda: ["limited", "backup"], generate, transcriber=None)
         self.server = LocalServer(("127.0.0.1", 0), self.store)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -41,7 +41,7 @@ class WebAppTests(unittest.TestCase):
         if data is not None:
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(self.url + path, data=json.dumps(data).encode() if data is not None else None, headers=headers)
-        return urllib.request.urlopen(req, timeout=5)
+        return urllib.request.urlopen(req, timeout=15)
 
     def wait_for_job(self, job_id):
         deadline = time.monotonic() + 5
@@ -81,6 +81,42 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(error.exception.code, code)
         self.assertEqual(self.calls, [])
 
+    def test_readalong_endpoint_automatically_prepares_and_preserves_markdown(self):
+        self.store.key_loader = lambda: ["backup"]
+        timing_calls = []
+
+        def transcribe(audio, key):
+            timing_calls.append(key)
+            return [{"text": "Hello", "start": 0, "end": 0.0001},
+                    {"text": "world", "start": 0.0001, "end": 0.0003}]
+
+        self.store.transcriber = transcribe
+        job = self.store.create("readalong.md", "Hello **world**.")
+        self.wait_for_job(job["id"])
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and self.store.get(job["id"]).get("sync_state") not in {"ready", "failed"}:
+            time.sleep(0.01)
+        with self.request(f"/api/jobs/{job['id']}/readalong") as response:
+            data = json.load(response)
+        self.assertEqual(data["sync_state"], "ready")
+        self.assertEqual(data["precision"], "word")
+        self.assertEqual(data["blocks"][0]["text"], "Hello world.")
+        self.assertEqual(len(data["cues"]), 2)
+        self.assertEqual(len(timing_calls), 1)
+        # Restore missing timing artifacts without regenerating the recording.
+        for path in (self.store.directory / job["id"]).rglob("*.words.json"):
+            path.unlink()
+        self.store.readalong_cache.clear()
+        self.assertEqual(self.store.readalong_data(job["id"])["precision"], "segment")
+        with self.request(f"/api/jobs/{job['id']}/sync", {}) as response:
+            json.load(response)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and self.store.get(job["id"]).get("sync_state") not in {"ready", "failed"}:
+            time.sleep(0.01)
+        self.assertEqual(self.store.readalong_data(job["id"])["precision"], "word")
+        self.assertEqual(len(timing_calls), 2)
+        self.assertEqual(len(self.calls), 1)
+
     def test_job_resume_after_restart_reuses_saved_audio(self):
         job = self.store.create("restart.md", "A short restart example.")
         job = self.wait_for_job(job["id"])
@@ -93,7 +129,7 @@ class WebAppTests(unittest.TestCase):
         def unexpected_generation(*args):
             raise AssertionError("Saved segment should have been reused")
 
-        reopened = JobStore(self.store.directory, lambda: ["backup"], unexpected_generation)
+        reopened = JobStore(self.store.directory, lambda: ["backup"], unexpected_generation, transcriber=None)
         self.store = reopened
         self.server.store = reopened
         self.assertEqual(reopened.get(job["id"])["state"], "interrupted")

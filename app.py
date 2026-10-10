@@ -19,6 +19,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from dotenv import dotenv_values
+import readalong
 
 from md_to_audio import ConversionCancelled, DEFAULT_MODEL, SPEECH_STYLE, _atomic_write, convert, markdown_text, split_chunks, synthesize
 
@@ -39,13 +40,16 @@ def timestamp() -> str:
 
 
 class JobStore:
-    def __init__(self, directory: Path, key_loader=configured_keys, generator=synthesize):
+    def __init__(self, directory: Path, key_loader=configured_keys, generator=synthesize, transcriber=readalong.transcribe_words):
         self.directory = directory
         self.directory.mkdir(parents=True, exist_ok=True)
         self.key_loader = key_loader
         self.generator = generator
+        self.transcriber = transcriber
         self.lock = threading.RLock()
         self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tovoice")
+        self.sync_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="readalong")
+        self.readalong_cache: dict[str, tuple] = {}
         self.jobs: dict[str, dict] = {}
         self.cancel_events: dict[str, threading.Event] = {}
         for path in directory.glob("*/job.json"):
@@ -55,6 +59,8 @@ class JobStore:
                     job.update(state="interrupted", message="Server restarted. Resume to continue saved segments.")
                 elif job["state"] == "cancelling":
                     job.update(state="cancelled", error=None, message="Recording cancelled. Saved segments are kept for resuming.")
+                if job.get("sync_state") in {"queued", "running"}:
+                    job["sync_state"] = "waiting"
                 self.jobs[job["id"]] = job
             except (OSError, ValueError, KeyError):
                 logging.warning("Could not load job metadata from %s", path)
@@ -107,6 +113,7 @@ class JobStore:
                 "key_switches": 0, "message": "Waiting to generate audio",
                 "output_path": str((folder / f"{safe_stem}.wav").resolve()),
                 "error": None,
+                "sync_state": "waiting", "sync_completed": 0, "sync_error": None,
             }
             self.jobs[job_id] = job
             self._save(job)
@@ -181,6 +188,8 @@ class JobStore:
                 else:
                     job.update(state="complete", message="Your recording is ready", finished_at=timestamp(), error=None)
                     self._save(job)
+            if job["state"] == "complete":
+                self.ensure_sync(job_id)
         except ConversionCancelled:
             with self.lock:
                 self._mark_cancelled(job)
@@ -193,8 +202,59 @@ class JobStore:
                     job.update(state="failed", error=str(exc), message="Generation paused. Saved segments are safe.")
                     self._save(job)
 
+    def ensure_sync(self, job_id: str, retry: bool = False) -> dict:
+        with self.lock:
+            job = self.jobs[job_id]
+            state = job.get("sync_state", "waiting")
+            if self.transcriber and job["state"] == "complete" and state not in {"queued", "running"} and (state not in {"failed", "ready"} or retry):
+                job.update(sync_state="queued", sync_error=None, sync_message="Preparing synchronized highlights")
+                self.readalong_cache.pop(job_id, None)
+                self._save(job)
+                self.sync_worker.submit(self._run_sync, job_id)
+            return dict(job)
+
+    def _run_sync(self, job_id: str) -> None:
+        def progress(number):
+            with self.lock:
+                job.update(sync_completed=number, sync_message=f"Preparing highlights: {number} of {job['total']} segments")
+                self.readalong_cache.pop(job_id, None)
+                self._save(job)
+
+        with self.lock:
+            job = self.jobs[job_id]
+            job.update(sync_state="running", sync_message="Matching spoken words to your Markdown")
+            self._save(job)
+        try:
+            source = (self.directory / job_id / "input.md").read_text(encoding="utf-8")
+            readalong.prepare(source, Path(job["output_path"]), job["model"], job["voice"], self.key_loader(), self.transcriber, progress)
+            with self.lock:
+                job.update(sync_state="ready", sync_error=None, sync_message="Synchronized highlights ready")
+                self.readalong_cache.pop(job_id, None)
+                self._save(job)
+        except Exception as exc:
+            logging.warning("Read-along preparation for %s failed: %s", job_id, exc)
+            with self.lock:
+                job.update(sync_state="failed", sync_error=str(exc), sync_message="Audio is ready. Highlight preparation paused.")
+                self._save(job)
+
+    def readalong_data(self, job_id: str) -> dict:
+        job = self.ensure_sync(job_id)
+        revision = (job["state"], job["completed"], job.get("sync_completed", 0), job.get("sync_state"))
+        with self.lock:
+            cached = self.readalong_cache.get(job_id)
+        if not cached or cached[0] != revision:
+            source = (self.directory / job_id / "input.md").read_text(encoding="utf-8")
+            data = readalong.document(source, Path(job["output_path"]), job["model"], job["voice"])
+            with self.lock:
+                self.readalong_cache[job_id] = (revision, data)
+        else:
+            data = cached[1]
+        return {**data, "sync_state": job.get("sync_state", "waiting"), "sync_error": job.get("sync_error"),
+                "sync_message": job.get("sync_message", "Highlights will be prepared when the audio is ready.")}
+
     def close(self) -> None:
         self.worker.shutdown(wait=True, cancel_futures=True)
+        self.sync_worker.shutdown(wait=True, cancel_futures=True)
 
 
 class LocalServer(ThreadingHTTPServer):
@@ -245,6 +305,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"jobs": self.server.store.list()})
             elif re.fullmatch(r"/api/jobs/[a-f0-9]{32}", route):
                 self._json(self.server.store.get(route.split("/")[-1]))
+            elif re.fullmatch(r"/api/jobs/[a-f0-9]{32}/readalong", route):
+                self._json(self.server.store.readalong_data(route.split("/")[3]))
             elif re.fullmatch(r"/api/jobs/[a-f0-9]{32}/(?:audio|transcript)", route):
                 _, _, _, job_id, kind = route.split("/")
                 job = self.server.store.get(job_id)
@@ -254,14 +316,14 @@ class Handler(BaseHTTPRequestHandler):
                 path = Path(job["output_path"]) if kind == "audio" else self.server.store.directory / job_id / "narration.txt"
                 self._file(path, download="download" in urlsplit(self.path).query, ranges=kind == "audio")
             else:
-                assets = {"/": "index.html", "/app.js": "app.js", "/styles.css": "styles.css"}
+                assets = {"/": "index.html", "/app.js": "app.js", "/timeline.js": "timeline.js", "/styles.css": "styles.css"}
                 if route not in assets:
                     self._json({"error": "Not found"}, 404)
                     return
                 self._file(ROOT / "web" / assets[route])
         except (KeyError, FileNotFoundError):
             self._json({"error": "Recording not found"}, 404)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
 
     def _file(self, path: Path, download: bool = False, ranges: bool = False) -> None:
@@ -321,6 +383,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(self.server.store.resume(route.split("/")[3]))
             elif re.fullmatch(r"/api/jobs/[a-f0-9]{32}/cancel", route):
                 self._json(self.server.store.cancel(route.split("/")[3]))
+            elif re.fullmatch(r"/api/jobs/[a-f0-9]{32}/sync", route):
+                self._json(self.server.store.ensure_sync(route.split("/")[3], retry=True))
             else:
                 self._json({"error": "Not found"}, 404)
         except KeyError:
